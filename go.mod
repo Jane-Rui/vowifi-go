@@ -1,4 +1,4 @@
-module github.com/Jane-Rui/vowifi-go
+module github.com/jane-rui/vowifi-go
 
 go 1.26.3
 
