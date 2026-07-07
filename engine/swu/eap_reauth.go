@@ -3,7 +3,7 @@ package swu
 import (
 	"strings"
 
-	"github.com/boa-z/vowifi-go/engine/swu/eapaka"
+	"github.com/jane-rui/vowifi-go/engine/swu/eapaka"
 )
 
 type EAPReauthenticationState struct {

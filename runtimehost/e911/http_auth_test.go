@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/boa-z/vowifi-go/runtimehost/carrier"
+	"github.com/jane-rui/vowifi-go/runtimehost/carrier"
 )
 
 func TestStartEmergencyAddressUpdateClassifiesHTTPAuthenticateChallenge(t *testing.T) {

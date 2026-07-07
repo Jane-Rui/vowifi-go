@@ -11,10 +11,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/boa-z/vowifi-go/engine/sim"
-	"github.com/boa-z/vowifi-go/engine/swu"
-	"github.com/boa-z/vowifi-go/engine/swu/eapaka"
-	"github.com/boa-z/vowifi-go/runtimehost/carrier"
+	"github.com/jane-rui/vowifi-go/engine/sim"
+	"github.com/jane-rui/vowifi-go/engine/swu"
+	"github.com/jane-rui/vowifi-go/engine/swu/eapaka"
+	"github.com/jane-rui/vowifi-go/runtimehost/carrier"
 )
 
 type fakeHTTPClient struct {

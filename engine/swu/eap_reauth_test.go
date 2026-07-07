@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"testing"
 
-	"github.com/boa-z/vowifi-go/engine/swu/eapaka"
+	"github.com/jane-rui/vowifi-go/engine/swu/eapaka"
 )
 
 func TestEAPReauthenticationStateApplyUpdateAcceptsNextIdentityAndPseudonym(t *testing.T) {

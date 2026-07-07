@@ -10,15 +10,15 @@ import (
 	"testing"
 	"time"
 
-	swusim "github.com/boa-z/vowifi-go/engine/sim"
-	"github.com/boa-z/vowifi-go/engine/swu"
-	"github.com/boa-z/vowifi-go/engine/swu/eapaka"
-	"github.com/boa-z/vowifi-go/runtimehost/eventhost"
-	"github.com/boa-z/vowifi-go/runtimehost/identity"
-	"github.com/boa-z/vowifi-go/runtimehost/messaging"
-	"github.com/boa-z/vowifi-go/runtimehost/simtransport"
-	"github.com/boa-z/vowifi-go/runtimehost/voiceclient"
-	"github.com/boa-z/vowifi-go/runtimehost/voicehost"
+	swusim "github.com/jane-rui/vowifi-go/engine/sim"
+	"github.com/jane-rui/vowifi-go/engine/swu"
+	"github.com/jane-rui/vowifi-go/engine/swu/eapaka"
+	"github.com/jane-rui/vowifi-go/runtimehost/eventhost"
+	"github.com/jane-rui/vowifi-go/runtimehost/identity"
+	"github.com/jane-rui/vowifi-go/runtimehost/messaging"
+	"github.com/jane-rui/vowifi-go/runtimehost/simtransport"
+	"github.com/jane-rui/vowifi-go/runtimehost/voiceclient"
+	"github.com/jane-rui/vowifi-go/runtimehost/voicehost"
 )
 
 type testModem struct{}

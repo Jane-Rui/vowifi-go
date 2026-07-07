@@ -53,7 +53,7 @@ module_path_check() {
 	local module_files=()
 	local legacy_refs=()
 
-	expected="${CI_MODULE_PATH:-github.com/boa-z/vowifi-go}"
+	expected="${CI_MODULE_PATH:-github.com/jane-rui/vowifi-go}"
 	legacy_base="${CI_LEGACY_MODULE_BASE:-github.com/iniwex5}"
 	legacy_module="${CI_LEGACY_MODULE:-${legacy_base%/}/vowifi-go}"
 
@@ -270,7 +270,7 @@ Environment:
   GO_BIN               path to go binary when it is not on PATH
   GOFMT_BIN            path to gofmt binary
   GOWORK               Go workspace mode, default: off for hermetic CI
-  CI_MODULE_PATH       expected module path, default: github.com/boa-z/vowifi-go
+  CI_MODULE_PATH       expected module path, default: github.com/jane-rui/vowifi-go
   CI_LEGACY_MODULE     legacy module path rejected in Go files
   CI_LEGACY_MODULE_BASE legacy owner/base used to build the default legacy path
   CI_PRIVACY_EMAIL_RE  personal email regex for privacy checks

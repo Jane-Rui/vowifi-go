@@ -55,7 +55,7 @@ GitHub Actions runs `.github/workflows/ci.yml` on Ubuntu against both the
 minimum Go patch required by `go.mod` and the latest patch in that Go minor
 line, calling `make ci` so local validation and the default CI job share the
 same entry point, including the canonical
-`github.com/boa-z/vowifi-go` module-path guard. The workflow can also be
+`github.com/jane-rui/vowifi-go` module-path guard. The workflow can also be
 started manually with optional race and coverage inputs, matching `make race`
 and `make coverage`.
 
@@ -73,7 +73,7 @@ does not require a modem, root privileges, or a real TUN device in CI.
 VoHive can use this repository through its workspace:
 
 ```go
-replace github.com/boa-z/vowifi-go v1.1.2 => ../vowifi-go
+replace github.com/jane-rui/vowifi-go v1.1.2 => ../vowifi-go
 ```
 
 ## VoHive Compatibility Check
@@ -85,12 +85,12 @@ VOHIVE_DIR=/path/to/vohive GO=/usr/local/go/bin/go GOFMT=/usr/local/go/bin/gofmt
 ```
 
 The script clones or copies the VoHive checkout into a temporary directory,
-first verifies this checkout still declares `github.com/boa-z/vowifi-go` and
+first verifies this checkout still declares `github.com/jane-rui/vowifi-go` and
 does not use the legacy module path in Go module/source files, rewrites legacy
-`vowifi-go` module references there to `github.com/boa-z/vowifi-go` when
+`vowifi-go` module references there to `github.com/jane-rui/vowifi-go` when
 needed, verifies no legacy module references remain, confirms the temporary
 VoHive module resolves
-`github.com/boa-z/vowifi-go` through a `replace` pointing at this repository,
+`github.com/jane-rui/vowifi-go` through a `replace` pointing at this repository,
 then runs the focused VoHive test set. The source VoHive checkout is not
 modified.
 
@@ -102,6 +102,6 @@ Useful overrides:
 - `VOHIVE_COMPAT_TMPDIR` chooses the parent directory for temporary clones and
   Go build work.
 - `VOWIFI_MODULE` changes the expected current module path; leave it unset for
-  the canonical `github.com/boa-z/vowifi-go` check.
+  the canonical `github.com/jane-rui/vowifi-go` check.
 - `VOWIFI_COMPAT_LEGACY_BASE` changes the legacy import owner/base rewritten
   inside the temporary VoHive copy.
