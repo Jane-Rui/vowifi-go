@@ -1,0 +1,27 @@
+﻿name: Sync upstream
+
+on:
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge parent upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          BRANCH: main
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${REPOSITORY}/merge-upstream" -f branch="${BRANCH}" --jq '{message:.message, merge_type:.merge_type, base_branch:.base_branch}'
