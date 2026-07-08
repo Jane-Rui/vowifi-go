@@ -199,6 +199,38 @@ func TestLoadCarrierOverridesNormalizesPCSCFCandidates(t *testing.T) {
 	}
 }
 
+func TestLoadCarrierOverridesIndexesNamedPresetByPLMN(t *testing.T) {
+	ClearCarrierOverrides()
+	t.Cleanup(ClearCarrierOverrides)
+
+	path := filepath.Join(t.TempDir(), "carriers.json")
+	if err := os.WriteFile(path, []byte(`{
+		"001013": {
+			"mcc": "001",
+			"mnc": "013",
+			"preset_id": "lab-wifi",
+			"network": {
+				"ims_realm": " ims.named.example. ",
+				"pcscf_fqdn": " pcscf.named.example. "
+			}
+		}
+	}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	res, err := LoadCarrierOverrides(path)
+	if err != nil {
+		t.Fatalf("LoadCarrierOverrides() error = %v", err)
+	}
+	if res.Missing || res.Count != 1 {
+		t.Fatalf("LoadResult=%+v, want one loaded override", res)
+	}
+	cfg := ResolveEffectiveCarrierConfig(EffectiveCarrierConfigInput{MCC: "001", MNC: "013"})
+	if cfg.PresetID != "lab-wifi" || cfg.Network.IMSRealm != "ims.named.example" ||
+		cfg.Network.PCSCFFQDN != "pcscf.named.example" {
+		t.Fatalf("ResolveEffectiveCarrierConfig(named preset)=%+v, want PLMN lookup to find override", cfg)
+	}
+}
+
 func TestLoadCarrierOverridesAcceptsNetworkAliases(t *testing.T) {
 	ClearCarrierOverrides()
 	t.Cleanup(ClearCarrierOverrides)
@@ -322,6 +354,184 @@ func TestLoadCarrierOverridesNormalizesAccessProfileMetadata(t *testing.T) {
 	}
 }
 
+func TestCarrierPolicyForSubscriberSurfacesIMSAndE911Metadata(t *testing.T) {
+	ClearCarrierOverrides()
+	t.Cleanup(ClearCarrierOverrides)
+
+	path := filepath.Join(t.TempDir(), "carriers.json")
+	if err := os.WriteFile(path, []byte(`{
+		"001016": {
+			"mcc": "001",
+			"mnc": "016",
+			"preset_id": "matrix-lab",
+			"e911": {
+				"enabled": true,
+				"provider": " Lab-TS43 ",
+				"websheet": "https://example.test/lab-e911",
+				"entitlement_endpoint": "https://example.test/lab-entitlement"
+			},
+			"network": {
+				"ims_realm": " ims.policy.example. ",
+				"private_identity_realm": " private.policy.example. ",
+				"pcscf_fqdns": ["pcscf-a.policy.example.", "pcscf-b.policy.example"],
+				"pani": " IEEE-802.11;i-wlan-node-id=\"node;16\" ",
+				"visited_network": " visited.policy.example ",
+				"service_urns": ["police", "URN:SERVICE:SOS.AMBULANCE"]
+			}
+		}
+	}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadCarrierOverrides(path); err != nil {
+		t.Fatalf("LoadCarrierOverrides() error = %v", err)
+	}
+
+	policy := CarrierPolicyForSubscriber(CarrierPolicyInput{IMSI: "001016123456789"})
+	if policy.MCC != "001" || policy.MNC != "016" || policy.PresetID != "matrix-lab" {
+		t.Fatalf("CarrierPolicy PLMN/Preset=%+v, want named 001/016 policy", policy)
+	}
+	if !policy.E911.Enabled || policy.E911.Provider != "lab-ts43" ||
+		policy.E911.Websheet != "https://example.test/lab-e911" ||
+		policy.E911.EntitlementEndpoint != "https://example.test/lab-entitlement" {
+		t.Fatalf("CarrierPolicy E911=%+v, want normalized E911 metadata", policy.E911)
+	}
+	if policy.IMS.IMSPrivateIdentity != "001016123456789@private.policy.example" ||
+		policy.IMS.IMSPublicIdentity != "sip:001016123456789@ims.policy.example" ||
+		policy.IMS.AccessNetworkInfo != `IEEE-802.11;i-wlan-node-id="node;16"` ||
+		policy.IMS.VisitedNetworkID != "visited.policy.example" {
+		t.Fatalf("CarrierPolicy IMS=%+v, want normalized IMS metadata", policy.IMS)
+	}
+	if !reflect.DeepEqual(policy.IMS.PCSCFFQDNs, []string{"pcscf-a.policy.example", "pcscf-b.policy.example"}) {
+		t.Fatalf("CarrierPolicy PCSCF=%+v", policy.IMS.PCSCFFQDNs)
+	}
+	wantURNs := []string{"urn:service:sos.police", "urn:service:sos.ambulance"}
+	if !reflect.DeepEqual(policy.IMS.EmergencyServiceURNs, wantURNs) ||
+		!reflect.DeepEqual(policy.Network.EmergencyServiceURNs, wantURNs) {
+		t.Fatalf("CarrierPolicy service URNs IMS=%+v Network=%+v, want %+v",
+			policy.IMS.EmergencyServiceURNs, policy.Network.EmergencyServiceURNs, wantURNs)
+	}
+}
+
+func TestPlanIMSRegistrationBuildsReadyCarrierSnapshot(t *testing.T) {
+	ClearCarrierOverrides()
+	t.Cleanup(ClearCarrierOverrides)
+
+	path := filepath.Join(t.TempDir(), "carriers.json")
+	if err := os.WriteFile(path, []byte(`{
+		"001018": {
+			"mcc": "001",
+			"mnc": "018",
+			"preset_id": "registration-lab",
+			"e911": {
+				"enabled": true,
+				"provider": " TS43 ",
+				"entitlement_endpoint": "https://example.test/entitlement"
+			},
+			"network": {
+				"ims_realm": " IMS.REG.EXAMPLE. ",
+				"private_identity_realm": " PRIVATE.REG.EXAMPLE. ",
+				"nai_realm": " NAI.REG.EXAMPLE. ",
+				"pcscf_fqdns": ["pcscf-a.reg.example.", "pcscf-b.reg.example"],
+				"epdg_fqdn": " epdg.reg.example. ",
+				"pani": " IEEE-802.11;i-wlan-node-id=\"node;18\" ",
+				"visited_network": " visited.reg.example ",
+				"service_urns": ["fire", "police"]
+			}
+		}
+	}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadCarrierOverrides(path); err != nil {
+		t.Fatalf("LoadCarrierOverrides() error = %v", err)
+	}
+
+	plan := PlanIMSRegistration(IMSRegistrationPlanInput{
+		IMSI:        "001018123456789",
+		LocalIP:     "fd00::10",
+		ContactPort: 6060,
+		UserAgent:   "test-agent",
+	})
+	if !plan.Ready || len(plan.Missing) != 0 {
+		t.Fatalf("PlanIMSRegistration() readiness=%v missing=%+v, want ready", plan.Ready, plan.Missing)
+	}
+	if plan.PresetID != "registration-lab" || plan.RegistrarURI != "sip:ims.reg.example" ||
+		plan.ContactURI != "sip:001018123456789@[fd00::10]:6060" ||
+		plan.IMPI != "001018123456789@private.reg.example" ||
+		plan.IMPU != "sip:001018123456789@ims.reg.example" ||
+		plan.PermanentNAI != "0001018123456789@nai.reg.example" {
+		t.Fatalf("IMS registration plan=%+v, want normalized identities and URIs", plan)
+	}
+	if !reflect.DeepEqual(plan.PCSCFFQDNs, []string{"pcscf-a.reg.example", "pcscf-b.reg.example"}) ||
+		plan.EPDGFQDN != "epdg.reg.example" ||
+		plan.IMSAPN != "ims" || plan.EmergencyAPN != "sos" {
+		t.Fatalf("IMS network plan=%+v", plan)
+	}
+	if got := plan.Headers["P-Access-Network-Info"]; got != `IEEE-802.11;i-wlan-node-id="node;18"` {
+		t.Fatalf("P-Access-Network-Info=%q", got)
+	}
+	if got := plan.Headers["P-Visited-Network-ID"]; got != `"visited.reg.example"` {
+		t.Fatalf("P-Visited-Network-ID=%q", got)
+	}
+	if !plan.E911.Enabled || plan.E911.Provider != "ts43" ||
+		!reflect.DeepEqual(plan.EmergencyServiceURNs, []string{"urn:service:sos.fire", "urn:service:sos.police"}) {
+		t.Fatalf("emergency policy in plan=%+v serviceURNs=%+v", plan.E911, plan.EmergencyServiceURNs)
+	}
+}
+
+func TestPlanIMSRegistrationReportsMissingContactAddress(t *testing.T) {
+	ClearCarrierOverrides()
+	t.Cleanup(ClearCarrierOverrides)
+
+	plan := PlanIMSRegistration(IMSRegistrationPlanInput{IMSI: "001010123456789"})
+	if plan.Ready {
+		t.Fatalf("PlanIMSRegistration() Ready=true, want false without contact address")
+	}
+	for _, field := range []string{"contact_host", "contact_uri"} {
+		if !registrationPlanMissingContains(plan.Missing, field) {
+			t.Fatalf("Missing=%+v, want %q", plan.Missing, field)
+		}
+	}
+	if plan.RegistrarURI != "sip:ims.mnc010.mcc001.3gppnetwork.org" ||
+		plan.ContactURI != "" ||
+		plan.ContactPort != 5060 {
+		t.Fatalf("plan=%+v, want registrar/default port but no contact URI", plan)
+	}
+}
+
+func TestPlanIMSRegistrationForPolicyPreservesExplicitIdentities(t *testing.T) {
+	policy := CarrierPolicy{
+		MCC:      "001",
+		MNC:      "019",
+		PresetID: "manual-policy",
+		Network: NetworkConfig{
+			IMSRealm:             "ims.manual.example",
+			PrivateIdentityRealm: "private.manual.example",
+			NAIRealm:             "nai.manual.example",
+			PCSCFFQDNs:           []string{"pcscf.manual.example"},
+			EPDGFQDN:             "epdg.manual.example",
+			VisitedNetworkID:     `"quoted.manual.example"`,
+		},
+		IMS: IMSAccessProfile{
+			IMSPrivateIdentity: "manual-impi@private.manual.example",
+			IMSPublicIdentity:  "sip:manual-user@ims.manual.example",
+			PermanentNAI:       "manual-nai@nai.manual.example",
+		},
+	}
+	plan := PlanIMSRegistrationForPolicy(policy, IMSRegistrationPlanInput{ContactHost: "192.0.2.9"})
+	if !plan.Ready {
+		t.Fatalf("PlanIMSRegistrationForPolicy() missing=%+v, want ready", plan.Missing)
+	}
+	if plan.IMPI != "manual-impi@private.manual.example" ||
+		plan.IMPU != "sip:manual-user@ims.manual.example" ||
+		plan.PermanentNAI != "manual-nai@nai.manual.example" ||
+		plan.ContactURI != "sip:manual-user@192.0.2.9:5060" {
+		t.Fatalf("plan=%+v, want explicit identities preserved", plan)
+	}
+	if got := plan.Headers["P-Visited-Network-ID"]; got != `"quoted.manual.example"` {
+		t.Fatalf("P-Visited-Network-ID=%q", got)
+	}
+}
+
 func TestIMSIdentityDomainCandidatesNormalizeAndDeriveDefaults(t *testing.T) {
 	candidates := IMSIdentityDomainCandidates(NetworkConfig{
 		IMSRealm:             " IMS.EXAMPLE.TEST. ",
@@ -383,4 +593,13 @@ func TestDeriveIdentitiesRejectInvalidSubscriberData(t *testing.T) {
 	if got := DefaultIMSRealm("31x", "001"); got != "" {
 		t.Fatalf("DefaultIMSRealm(invalid MCC)=%q, want empty", got)
 	}
+}
+
+func registrationPlanMissingContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

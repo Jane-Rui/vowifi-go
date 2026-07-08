@@ -1486,6 +1486,130 @@ func TestRegisterSessionFailureInfoCapturesDiagnosticHeaders(t *testing.T) {
 	}
 }
 
+func TestPlanRegistrationRecoveryAuthenticatesWithSecurityMetadata(t *testing.T) {
+	rawNonce := append(bytesFrom(0x22, 16), bytesFrom(0x52, 16)...)
+	challenge := `Digest realm="ims.example", nonce="` + base64.StdEncoding.EncodeToString(rawNonce) + `", algorithm=AKAv2-MD5, qop="auth-int"`
+	resp := RegisterResponse{
+		StatusCode: 407,
+		Reason:     "Proxy Authentication Required",
+		Headers: map[string][]string{
+			"Proxy-Authenticate": {challenge},
+			"Security-Server": {
+				`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=111;spi-s=222;port-c=5062;port-s=5063;q=0.7`,
+			},
+			"Warning": {`399 pcscf.example "security association required"`},
+		},
+	}
+
+	plan := PlanRegistrationRecovery(resp, 600, time.Time{})
+	if plan.Action != RegistrationRecoveryActionAuthenticate ||
+		!plan.Recoverable ||
+		!plan.Retry ||
+		plan.Terminal ||
+		!plan.AuthenticationRefreshNeeded ||
+		!plan.SecurityAssociationNeeded ||
+		plan.ChallengeHeaderName != "Proxy-Authenticate" ||
+		plan.AuthorizationHeaderName != "Proxy-Authorization" ||
+		plan.ChallengeHeader != challenge ||
+		!plan.ChallengeValid ||
+		plan.Challenge.Algorithm != "AKAv2-MD5" ||
+		plan.Challenge.QOP != "auth-int" ||
+		plan.SecurityVerify == "" ||
+		len(plan.SecurityServer) != 1 {
+		t.Fatalf("auth recovery plan=%+v", plan)
+	}
+	assertRegistrationFailureInfo(t, plan.FailureInfo, 407, "Proxy Authentication Required", 0,
+		[]string{`399 pcscf.example "security association required"`}, nil)
+}
+
+func TestPlanRegistrationRecoveryClassifiesRegisterFailures(t *testing.T) {
+	now := time.Date(2026, 7, 7, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name       string
+		resp       RegisterResponse
+		expires    int
+		wantAction RegistrationRecoveryAction
+		check      func(t *testing.T, plan RegistrationRecoveryPlan)
+	}{
+		{
+			name: "min expires retry",
+			resp: RegisterResponse{
+				StatusCode: 423,
+				Reason:     "Interval Too Brief",
+				Headers:    map[string][]string{"Min-Expires": {"1200"}},
+			},
+			expires:    600,
+			wantAction: RegistrationRecoveryActionRetryMinExpires,
+			check: func(t *testing.T, plan RegistrationRecoveryPlan) {
+				if !plan.Recoverable || !plan.Retry || plan.Terminal || plan.MinExpires != 1200 || plan.NextExpires != 1200 {
+					t.Fatalf("423 plan=%+v", plan)
+				}
+			},
+		},
+		{
+			name: "server backoff retry after zero",
+			resp: RegisterResponse{
+				StatusCode: 503,
+				Reason:     "Service Unavailable",
+				Headers:    map[string][]string{"Retry-After": {"0"}},
+			},
+			expires:    600,
+			wantAction: RegistrationRecoveryActionBackoffRetry,
+			check: func(t *testing.T, plan RegistrationRecoveryPlan) {
+				if !plan.Recoverable || !plan.Retry || plan.Terminal ||
+					!plan.RegistrationRecoveryNeeded ||
+					!plan.RetryAfterPresent ||
+					plan.RetryAfter != 0 ||
+					!plan.NextAttemptAt.Equal(now) {
+					t.Fatalf("503 plan=%+v", plan)
+				}
+			},
+		},
+		{
+			name: "security agreement retry",
+			resp: RegisterResponse{
+				StatusCode: 494,
+				Reason:     "Security Agreement Required",
+				Headers: map[string][]string{
+					"Security-Server": {`ipsec-3gpp;alg=hmac-sha-1-96;ealg=null;spi-c=333;spi-s=444;port-c=5062;port-s=5063`},
+				},
+			},
+			expires:    600,
+			wantAction: RegistrationRecoveryActionRefreshSecurity,
+			check: func(t *testing.T, plan RegistrationRecoveryPlan) {
+				if !plan.SecurityAssociationNeeded || !plan.Recoverable || !plan.Retry || plan.Terminal ||
+					plan.SecurityVerify == "" || len(plan.SecurityServer) != 1 {
+					t.Fatalf("494 plan=%+v", plan)
+				}
+			},
+		},
+		{
+			name: "forbidden identity refresh",
+			resp: RegisterResponse{
+				StatusCode: 403,
+				Reason:     "Forbidden",
+			},
+			expires:    600,
+			wantAction: RegistrationRecoveryActionRefreshIdentity,
+			check: func(t *testing.T, plan RegistrationRecoveryPlan) {
+				if !plan.IdentityRefreshNeeded || plan.Retry || !plan.Terminal || plan.Recoverable {
+					t.Fatalf("403 plan=%+v", plan)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan := PlanRegistrationRecovery(tt.resp, tt.expires, now)
+			if plan.Action != tt.wantAction || plan.StatusCode != tt.resp.StatusCode || plan.RequestedExpires != tt.expires {
+				t.Fatalf("PlanRegistrationRecovery()=%+v", plan)
+			}
+			tt.check(t, plan)
+		})
+	}
+}
+
 func TestRegisterSessionFallsBackToSupportedDigestChallenge(t *testing.T) {
 	rawNonce := append(bytesFrom(0x10, 16), bytesFrom(0x40, 16)...)
 	transport := &fakeRegisterTransport{responses: []RegisterResponse{
@@ -3242,6 +3366,72 @@ func TestBuildPrackRequestForProvisionalResponse(t *testing.T) {
 	}
 }
 
+func TestBuildPrackPlanForProvisionalResponseIncludesDialogUpdatesAndAnswer(t *testing.T) {
+	remoteOffer := []byte("v=0\r\nm=audio 40000 RTP/AVP 0\r\n")
+	sdpAnswer := []byte("v=0\r\nm=audio 50000 RTP/AVP 0\r\n")
+	wantOffer := string(remoteOffer)
+	wantAnswer := string(sdpAnswer)
+	resp := SIPResponse{
+		StatusCode: 183,
+		Reason:     "Session Progress",
+		Headers: map[string][]string{
+			"Require":      {"100rel"},
+			"RSeq":         {"23"},
+			"CSeq":         {"8 INVITE"},
+			"To":           {"<sip:+18005551212@ims.example>;tag=remote-plan"},
+			"Contact":      {"<sip:+18005551212@pcscf.example;transport=udp>"},
+			"Record-Route": {"<sip:edge1.example;lr>, <sip:edge2.example;lr>"},
+			"Content-Type": {"application/sdp; charset=utf-8"},
+		},
+		Body: remoteOffer,
+	}
+	plan, ok, err := BuildPrackPlanForProvisionalResponse(DialogRequestConfig{
+		Profile: IMSProfile{IMPU: "sip:user@example"},
+		Registration: RegistrationBinding{
+			ContactURI:    "sip:user@192.0.2.10:5060",
+			ServiceRoutes: []string{"<sip:service-route.example;lr>"},
+		},
+		RemoteURI: "sip:+18005551212@ims.example",
+		CallID:    "call-prack-plan",
+		LocalTag:  "local-plan",
+		CSeq:      10,
+	}, resp, sdpAnswer)
+	if err != nil || !ok {
+		t.Fatalf("BuildPrackPlanForProvisionalResponse() ok=%v err=%v", ok, err)
+	}
+	if !plan.Info.Reliable || plan.Info.RAck != "23 8 INVITE" || !plan.Info.EarlyMedia ||
+		plan.Info.ContentType != "application/sdp; charset=utf-8" ||
+		plan.Info.RemoteTag != "remote-plan" ||
+		plan.Info.ContactURI != "sip:+18005551212@pcscf.example;transport=udp" ||
+		plan.Info.RemoteTargetURI != plan.Info.ContactURI {
+		t.Fatalf("provisional info=%+v", plan.Info)
+	}
+	if len(plan.Info.RouteSet) != 2 || plan.Info.RouteSet[0] != "<sip:edge2.example;lr>" ||
+		plan.Info.RouteSet[1] != "<sip:edge1.example;lr>" {
+		t.Fatalf("route set=%+v", plan.Info.RouteSet)
+	}
+	if plan.Dialog.RemoteTag != "remote-plan" ||
+		plan.Dialog.RemoteTargetURI != "sip:+18005551212@pcscf.example;transport=udp" ||
+		len(plan.Dialog.RouteSet) != 2 {
+		t.Fatalf("dialog config=%+v", plan.Dialog)
+	}
+	if plan.Request.Method != "PRACK" ||
+		plan.Request.URI != "sip:+18005551212@pcscf.example;transport=udp" ||
+		plan.Request.Headers["RAck"] != "23 8 INVITE" ||
+		plan.Request.Headers["CSeq"] != "10 PRACK" ||
+		plan.Request.Headers["To"] != "<sip:+18005551212@ims.example>;tag=remote-plan" ||
+		plan.Request.Headers["Route"] != "<sip:edge2.example;lr>, <sip:edge1.example;lr>" ||
+		plan.Request.Headers["Content-Type"] != "application/sdp" ||
+		string(plan.Request.Body) != wantAnswer {
+		t.Fatalf("PRACK plan request=%+v body=%q", plan.Request, plan.Request.Body)
+	}
+	remoteOffer[0] = 'x'
+	sdpAnswer[0] = 'x'
+	if string(plan.Info.SDP) != wantOffer || string(plan.Request.Body) != wantAnswer {
+		t.Fatalf("plan kept mutable SDP backing slices: offer=%q answer=%q", plan.Info.SDP, plan.Request.Body)
+	}
+}
+
 func TestBuildPrackRequestForProvisionalResponseSkipsUnreliable(t *testing.T) {
 	resp := SIPResponse{
 		StatusCode: 180,
@@ -3251,6 +3441,22 @@ func TestBuildPrackRequestForProvisionalResponseSkipsUnreliable(t *testing.T) {
 	prack, ok, err := BuildPrackRequestForProvisionalResponse(DialogRequestConfig{}, resp)
 	if err != nil || ok || prack.Method != "" {
 		t.Fatalf("BuildPrackRequestForProvisionalResponse() msg=%+v ok=%v err=%v", prack, ok, err)
+	}
+	plan, ok, err := BuildPrackPlanForProvisionalResponse(DialogRequestConfig{}, resp, []byte("v=0\r\n"))
+	if err != nil || ok || plan.Request.Method != "" || plan.Info.Reliable {
+		t.Fatalf("BuildPrackPlanForProvisionalResponse() plan=%+v ok=%v err=%v", plan, ok, err)
+	}
+	_, _, err = BuildPrackPlanForProvisionalResponse(DialogRequestConfig{}, SIPResponse{
+		StatusCode: 183,
+		Reason:     "Session Progress",
+		Headers: map[string][]string{
+			"Require": {"100rel"},
+			"RSeq":    {"bad"},
+			"CSeq":    {"3 INVITE"},
+		},
+	}, nil)
+	if !errors.Is(err, ErrInvalidSIPMessage) {
+		t.Fatalf("BuildPrackPlanForProvisionalResponse(invalid RSeq) err=%v, want ErrInvalidSIPMessage", err)
 	}
 	_, err = ParseProvisionalResponseInfo(SIPResponse{
 		StatusCode: 183,

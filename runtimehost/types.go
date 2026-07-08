@@ -127,6 +127,7 @@ type SIMAccessRecoveryRequest struct {
 	Attempt            int
 	Class              simtransport.RecoveryClass
 	Err                error
+	Decision           simtransport.ControlPortRecoveryDecision
 	DestructiveAllowed bool
 }
 
@@ -136,6 +137,7 @@ type SIMAccessRecoveryHook interface {
 
 type SIMAccessRecoveryOptions struct {
 	AllowVendorSpecific bool
+	ControlPortType     string
 	DryRun              bool
 	Delay               simtransport.ATRecoveryDelayFunc
 }
@@ -173,7 +175,7 @@ func (a *modemAccessAdapter) GetIMEI() (string, error) {
 	if err == nil {
 		return imei, nil
 	}
-	req, ok := newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationIMEI, 1, err)
+	req, ok := a.newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationIMEI, 1, err)
 	if !ok {
 		return "", err
 	}
@@ -221,7 +223,7 @@ func (a *modemAccessAdapter) GetISIMIdentity() (identity.Identity, error) {
 	if err == nil {
 		return id, nil
 	}
-	req, ok := newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationISIMIdentity, 1, err)
+	req, ok := a.newSIMAccessRecoveryRequest(SIMAccessRecoveryOperationISIMIdentity, 1, err)
 	if !ok {
 		return identity.Identity{}, err
 	}
@@ -291,16 +293,26 @@ func (a *modemAccessAdapter) recoverSIMAccess(req SIMAccessRecoveryRequest) (boo
 	if !ok {
 		return false, nil
 	}
-	steps := simtransport.PlanATControlRecovery(req.Class, defaultATRecoveryPlanAttempt(req.Attempt))
-	if len(steps) == 0 {
-		return false, nil
+	decision := req.Decision
+	if !decision.Recoverable {
+		decision = simtransport.ClassifyControlPortRecovery(simtransport.ControlPortRecoveryInput{
+			Err:          req.Err,
+			Attempt:      defaultATRecoveryPlanAttempt(req.Attempt),
+			PortType:     a.recovery.ControlPortType,
+			Operation:    req.Operation,
+			IdentityRead: true,
+		})
 	}
+	steps := simtransport.ControlPortRecoverySteps(decision)
 	opts := simtransport.ATRecoveryOptions{
 		AllowVendorSpecific: req.DestructiveAllowed || a.recovery.AllowVendorSpecific,
 		DryRun:              a.recovery.DryRun,
 		Delay:               a.recovery.Delay,
 	}
-	return true, simtransport.ExecuteATControlRecovery(context.Background(), at, steps, opts)
+	if len(simtransport.ExecutableATRecoverySteps(steps, opts)) == 0 && !opts.DryRun {
+		return false, nil
+	}
+	return true, simtransport.ExecuteControlPortRecovery(context.Background(), at, decision, opts)
 }
 
 func defaultATRecoveryPlanAttempt(attempt int) int {
@@ -310,16 +322,23 @@ func defaultATRecoveryPlanAttempt(attempt int) int {
 	return attempt - 1
 }
 
-func newSIMAccessRecoveryRequest(operation string, attempt int, err error) (SIMAccessRecoveryRequest, bool) {
-	class := simtransport.ClassifyError(err)
-	if !class.Recoverable() {
+func (a *modemAccessAdapter) newSIMAccessRecoveryRequest(operation string, attempt int, err error) (SIMAccessRecoveryRequest, bool) {
+	decision := simtransport.ClassifyControlPortRecovery(simtransport.ControlPortRecoveryInput{
+		Err:          err,
+		Attempt:      defaultATRecoveryPlanAttempt(attempt),
+		PortType:     a.recovery.ControlPortType,
+		Operation:    operation,
+		IdentityRead: true,
+	})
+	if !decision.Recoverable {
 		return SIMAccessRecoveryRequest{}, false
 	}
 	return SIMAccessRecoveryRequest{
 		Operation:          operation,
 		Attempt:            attempt,
-		Class:              class,
+		Class:              decision.Class,
 		Err:                err,
+		Decision:           decision,
 		DestructiveAllowed: false,
 	}, true
 }
@@ -1778,6 +1797,15 @@ func (i *Instance) State() State {
 	return i.state
 }
 
+func (i *Instance) DiagnosticState() DiagnosticState {
+	if i == nil {
+		return DiagnosticState{}
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	return SafeDiagnosticState(i.state)
+}
+
 func (i *Instance) SetNotifier(fn func(string)) {
 	if i == nil {
 		return
@@ -1883,16 +1911,18 @@ func (i *Instance) Obs() map[string]interface{} {
 	}
 	i.mu.RLock()
 	defer i.mu.RUnlock()
+	state := SafeDiagnosticState(i.state)
 	return map[string]interface{}{
-		"device_id":                    i.state.DeviceID,
-		"phase":                        string(i.state.Phase),
-		"sms_ready":                    i.state.SMSReady,
-		"ims_ready":                    i.state.IMSReady,
-		"ims_recovery_pending":         i.state.IMSRecoveryPending,
-		"ims_recovery_retry_after":     i.state.IMSRecoveryRetryAfter,
-		"ims_recovery_next_attempt_at": i.state.IMSRecoveryNextAttemptAt,
-		"ims_recovery_reason":          i.state.IMSRecoveryReason,
-		"updated":                      i.state.UpdatedAt,
+		"device_id":                    state.DeviceID,
+		"phase":                        string(state.Phase),
+		"sms_ready":                    state.SMSReady,
+		"ims_ready":                    state.IMSReady,
+		"ims_recovery_pending":         state.IMSRecoveryPending,
+		"ims_recovery_retry_after":     state.IMSRecoveryRetryAfter,
+		"ims_recovery_next_attempt_at": state.IMSRecoveryNextAttemptAt,
+		"ims_recovery_reason":          state.IMSRecoveryReason,
+		"updated":                      state.UpdatedAt,
+		"redacted":                     state.Redacted,
 	}
 }
 
@@ -1908,26 +1938,27 @@ func (i *Instance) dispatchRuntimeState(ctx context.Context) {
 }
 
 func runtimeStateSnapshot(state State) eventhost.RuntimeStateSnapshot {
+	diagnostic := SafeDiagnosticState(state)
 	return eventhost.RuntimeStateSnapshot{
-		DevID:                    state.DeviceID,
-		Phase:                    string(state.Phase),
-		DataplaneMode:            state.DataplaneMode,
-		SIMReady:                 state.SIMReady,
-		AccessReady:              state.AccessReady,
-		TunnelReady:              state.TunnelReady,
-		IMSReady:                 state.IMSReady,
-		SMSReady:                 state.SMSReady,
-		RegStatus:                state.RegStatus,
-		RegStatusText:            state.RegStatusText,
-		NetworkMode:              state.NetworkMode,
-		LastErrorClass:           state.LastErrorClass,
-		LastError:                state.LastError,
-		LastReason:               state.LastReason,
-		IMSRecoveryPending:       state.IMSRecoveryPending,
-		IMSRecoveryRetryAfter:    state.IMSRecoveryRetryAfter,
-		IMSRecoveryNextAttemptAt: state.IMSRecoveryNextAttemptAt,
-		IMSRecoveryReason:        state.IMSRecoveryReason,
-		Time:                     state.UpdatedAt,
+		DevID:                    diagnostic.DeviceID,
+		Phase:                    string(diagnostic.Phase),
+		DataplaneMode:            diagnostic.DataplaneMode,
+		SIMReady:                 diagnostic.SIMReady,
+		AccessReady:              diagnostic.AccessReady,
+		TunnelReady:              diagnostic.TunnelReady,
+		IMSReady:                 diagnostic.IMSReady,
+		SMSReady:                 diagnostic.SMSReady,
+		RegStatus:                diagnostic.RegStatus,
+		RegStatusText:            diagnostic.RegStatusText,
+		NetworkMode:              diagnostic.NetworkMode,
+		LastErrorClass:           diagnostic.LastErrorClass,
+		LastError:                diagnostic.LastError,
+		LastReason:               diagnostic.LastReason,
+		IMSRecoveryPending:       diagnostic.IMSRecoveryPending,
+		IMSRecoveryRetryAfter:    diagnostic.IMSRecoveryRetryAfter,
+		IMSRecoveryNextAttemptAt: diagnostic.IMSRecoveryNextAttemptAt,
+		IMSRecoveryReason:        diagnostic.IMSRecoveryReason,
+		Time:                     diagnostic.UpdatedAt,
 	}
 }
 

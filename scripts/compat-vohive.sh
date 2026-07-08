@@ -124,6 +124,25 @@ verify_vowifi_replace() {
 	printf '\n==> verified VoHive resolves %s through this checkout\n' "$VOWIFI_MODULE"
 }
 
+ensure_vohive_embed_assets() {
+	if [[ ! -f internal/web/fs.go ]]; then
+		return
+	fi
+	if ! grep -q 'go:embed all:dist' internal/web/fs.go; then
+		return
+	fi
+	if find internal/web/dist -type f -print -quit >/dev/null 2>&1; then
+		return
+	fi
+
+	printf '\n==> creating temporary VoHive web embed placeholder\n'
+	mkdir -p internal/web/dist
+	cat >internal/web/dist/index.html <<'EOF'
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>VoHive compatibility placeholder</title></head><body></body></html>
+EOF
+}
+
 VOHIVE_DIR="${VOHIVE_DIR:-${1:-}}"
 if [[ -z "$VOHIVE_DIR" ]]; then
 	usage >&2
@@ -139,9 +158,9 @@ VOWIFI_MODULE="${VOWIFI_MODULE:-github.com/jane-rui/vowifi-go}"
 legacy_base="${VOWIFI_COMPAT_LEGACY_BASE:-github.com/iniwex5}"
 legacy_base="${legacy_base%/}"
 LEGACY_MODULE="${legacy_base}/vowifi-go"
-VOHIVE_COMPAT_PACKAGES="${VOHIVE_COMPAT_PACKAGES:-./internal/vowifihost ./internal/api ./internal/notify ./internal/e911}"
+VOHIVE_COMPAT_PACKAGES="${VOHIVE_COMPAT_PACKAGES:-./cmd/vohive ./internal/api ./internal/cscall ./internal/device ./internal/e911 ./internal/notify ./internal/sim ./internal/vowifihost}"
 VOHIVE_COMPAT_RUN="${VOHIVE_COMPAT_RUN:-VoWiFi|RuntimeStart|StartRuntime|Tunnel|MOBIKE|Dataplane|IMS|Voice|USSD|E911|Emergency|Websheet}"
-VOHIVE_COMPAT_BUILD_PACKAGES="${VOHIVE_COMPAT_BUILD_PACKAGES:-}"
+VOHIVE_COMPAT_BUILD_PACKAGES="${VOHIVE_COMPAT_BUILD_PACKAGES:-./cmd/vohive}"
 VOHIVE_COMPAT_TMPDIR="${VOHIVE_COMPAT_TMPDIR:-${TMPDIR:-/tmp}}"
 VOHIVE_COMPAT_KEEP_TMP="${VOHIVE_COMPAT_KEEP_TMP:-0}"
 
@@ -182,6 +201,7 @@ fi
 
 cd "$workdir"
 mkdir -p "$tmpdir/go-tmp"
+ensure_vohive_embed_assets
 
 verify_local_module
 

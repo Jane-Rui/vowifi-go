@@ -35,6 +35,8 @@ type RTPRelayConfig struct {
 	SRTP                *RTPRelaySRTPConfig
 	RTCPFeedbackHandler RTCPFeedbackHandler
 	RTPDTMFHandler      RTPDTMFHandler
+	RTPQualityHandler   RTPRelayQualityHandler
+	RTPQualityConfig    RTPRelayQualityConfig
 	RTCPReportSchedule  RTPRelayRTCPReportScheduleConfig
 }
 
@@ -158,6 +160,24 @@ type RTPRelayQualityStats struct {
 	RTCPFeedbackParseErrors uint64
 }
 
+type RTPRelayQualityHandler func(RTPRelayQualityEvent)
+
+type RTPRelayQualityConfig struct {
+	ClientToIMS RTPStreamDiagnosisConfig
+	IMSToClient RTPStreamDiagnosisConfig
+	EmitInitial bool
+}
+
+type RTPRelayQualityEvent struct {
+	Direction      RTCPFeedbackDirection
+	Status         RTPStreamDiagnosisStatus
+	PreviousStatus RTPStreamDiagnosisStatus
+	Reasons        []RTPStreamDiagnosisReason
+	Quality        RTPRelayDirectionQuality
+	Diagnoses      []RTPStreamDiagnosis
+	ObservedAt     time.Time
+}
+
 type RTPRelayDirectionQuality struct {
 	Direction             RTCPFeedbackDirection
 	RTPPackets            uint64
@@ -191,6 +211,50 @@ type RTPRelayRTCPReportQuality struct {
 	LastSenderReport   uint32
 	Delay              uint32
 	RoundTripTime      time.Duration
+}
+
+// RTPRelayQualityAction is a recovery hint for media quality degradation.
+type RTPRelayQualityAction string
+
+const (
+	RTPRelayQualityActionNone                 RTPRelayQualityAction = "none"
+	RTPRelayQualityActionMonitor              RTPRelayQualityAction = "monitor"
+	RTPRelayQualityActionIncreaseJitterBuffer RTPRelayQualityAction = "increase_jitter_buffer"
+	RTPRelayQualityActionReduceBitrate        RTPRelayQualityAction = "reduce_bitrate"
+	RTPRelayQualityActionRecoverMediaPath     RTPRelayQualityAction = "recover_media_path"
+)
+
+// RTPRelayRTCPReportDiagnosis classifies one remote RTCP reception report.
+type RTPRelayRTCPReportDiagnosis struct {
+	Direction     RTCPFeedbackDirection
+	ReporterSSRC  uint32
+	MediaSSRC     uint32
+	Status        RTPStreamDiagnosisStatus
+	Reasons       []RTPStreamDiagnosisReason
+	Action        RTPRelayQualityAction
+	Loss          RTPRelayRTCPReportLossDiagnosis
+	Jitter        RTPRelayRTCPReportJitterDiagnosis
+	RoundTripTime RTPRelayRTCPReportRoundTripTimeDiagnosis
+}
+
+// RTPRelayRTCPReportLossDiagnosis classifies the report-block loss fields.
+type RTPRelayRTCPReportLossDiagnosis struct {
+	Status       RTPStreamDiagnosisStatus
+	FractionLost uint8
+	TotalLost    uint32
+}
+
+// RTPRelayRTCPReportJitterDiagnosis classifies report-block jitter using the configured clock rate.
+type RTPRelayRTCPReportJitterDiagnosis struct {
+	Status   RTPStreamDiagnosisStatus
+	Jitter   uint32
+	Duration time.Duration
+}
+
+// RTPRelayRTCPReportRoundTripTimeDiagnosis classifies RTT computed from LSR/DLSR timing.
+type RTPRelayRTCPReportRoundTripTimeDiagnosis struct {
+	Status        RTPStreamDiagnosisStatus
+	RoundTripTime time.Duration
 }
 
 type RTPRelaySession struct {
@@ -234,6 +298,8 @@ type RTPRelaySession struct {
 	clientToIMSRTCPReports map[rtpRelayRTCPReportKey]RTPRelayRTCPReportQuality
 	imsToClientRTCPReports map[rtpRelayRTCPReportKey]RTPRelayRTCPReportQuality
 	rtcpSenderReportTiming map[rtpRelayRTCPSenderReportKey]rtpRelayRTCPSenderReportTiming
+	qualityEventMu         sync.Mutex
+	qualityEventState      map[RTCPFeedbackDirection]rtpRelayQualitySignature
 
 	clientToIMSRTPPackets                atomic.Uint64
 	imsToClientRTPPackets                atomic.Uint64
@@ -250,6 +316,8 @@ type RTPRelaySession struct {
 	transforms                           RTPRelayTransforms
 	rtcpFeedbackHandler                  RTCPFeedbackHandler
 	rtpDTMFHandler                       RTPDTMFHandler
+	rtpQualityHandler                    RTPRelayQualityHandler
+	rtpQualityConfig                     RTPRelayQualityConfig
 	rtcpFeedbackPackets                  atomic.Uint64
 	rtcpFeedbackParseErrors              atomic.Uint64
 	rtcpSenderReports                    atomic.Uint64
@@ -295,6 +363,11 @@ type rtpRelayRTCPSenderReportKey struct {
 type rtpRelayRTCPSenderReportTiming struct {
 	lastSenderReport uint32
 	observedAt       time.Time
+}
+
+type rtpRelayQualitySignature struct {
+	status  RTPStreamDiagnosisStatus
+	reasons string
 }
 
 func NewRTPRelaySession(ctx context.Context, cfg RTPRelayConfig, clientTarget SDPInfo) (*RTPRelaySession, error) {
@@ -364,6 +437,8 @@ func newRTPRelaySession(ctx context.Context, cfg RTPRelayConfig) (*RTPRelaySessi
 		transforms:           cfg.Transforms,
 		rtcpFeedbackHandler:  cfg.RTCPFeedbackHandler,
 		rtpDTMFHandler:       cfg.RTPDTMFHandler,
+		rtpQualityHandler:    cfg.RTPQualityHandler,
+		rtpQualityConfig:     cfg.RTPQualityConfig,
 		dtmfClientToIMSState: newRTPDTMFSequenceState(),
 		dtmfIMSToClientState: newRTPDTMFSequenceState(),
 	}
@@ -649,6 +724,312 @@ func rtpRelayFractionLost(lost, expected uint64) uint8 {
 		return 255
 	}
 	return uint8(fraction)
+}
+
+// DiagnoseRTPRelayRTCPReports classifies remote RTCP reception reports and
+// preserves the input order.
+func DiagnoseRTPRelayRTCPReports(reports []RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig) []RTPRelayRTCPReportDiagnosis {
+	if len(reports) == 0 {
+		return nil
+	}
+	out := make([]RTPRelayRTCPReportDiagnosis, 0, len(reports))
+	for _, report := range reports {
+		out = append(out, report.Diagnose(cfg))
+	}
+	return out
+}
+
+// DiagnoseRTCPReports classifies the RTCP reports already present in a quality snapshot.
+func (q RTPRelayDirectionQuality) DiagnoseRTCPReports(cfg RTPStreamDiagnosisConfig) []RTPRelayRTCPReportDiagnosis {
+	return DiagnoseRTPRelayRTCPReports(q.RTCPReports, cfg)
+}
+
+// Diagnose classifies loss, jitter, and RTT for one remote RTCP reception report.
+func (r RTPRelayRTCPReportQuality) Diagnose(cfg RTPStreamDiagnosisConfig) RTPRelayRTCPReportDiagnosis {
+	cfg = normalizeRTPStreamDiagnosisConfig(cfg)
+	diagnosis := RTPRelayRTCPReportDiagnosis{
+		Direction:     r.Direction,
+		ReporterSSRC:  r.ReporterSSRC,
+		MediaSSRC:     r.MediaSSRC,
+		Status:        RTPStreamDiagnosisStatusUnknown,
+		Loss:          diagnoseRTPRelayRTCPReportLoss(r, cfg),
+		Jitter:        diagnoseRTPRelayRTCPReportJitter(r, cfg),
+		RoundTripTime: diagnoseRTPRelayRTCPReportRoundTripTime(r, cfg),
+	}
+	diagnosis.addMetric(diagnosis.Loss.Status, RTPStreamDiagnosisReasonPacketLoss)
+	diagnosis.addMetric(diagnosis.Jitter.Status, RTPStreamDiagnosisReasonJitter)
+	diagnosis.addMetric(diagnosis.RoundTripTime.Status, RTPStreamDiagnosisReasonRoundTripTime)
+	diagnosis.Action = rtpRelayRTCPReportAction(diagnosis)
+	return diagnosis
+}
+
+func (s *RTPRelaySession) emitRTPQualityEventIfChanged(direction RTCPFeedbackDirection, observedAt time.Time) {
+	if s == nil || s.rtpQualityHandler == nil {
+		return
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+	quality := s.rtpRelayDirectionQuality(direction)
+	diagnosisConfig := s.rtpQualityDiagnosisConfig(direction)
+	diagnoses := DiagnoseRTPStreamStats(quality.RTPStreams, diagnosisConfig)
+	status, reasons := summarizeRTPRelayQualityDiagnoses(diagnoses)
+	status, reasons = summarizeRTPRelayRTCPReportQuality(quality.RTCPReports, diagnosisConfig, status, reasons)
+	if status == RTPStreamDiagnosisStatusUnknown {
+		return
+	}
+	signature := newRTPRelayQualitySignature(status, reasons)
+	previousStatus := RTPStreamDiagnosisStatusUnknown
+	emit := false
+
+	s.qualityEventMu.Lock()
+	if s.qualityEventState == nil {
+		s.qualityEventState = make(map[RTCPFeedbackDirection]rtpRelayQualitySignature)
+	}
+	previous, ok := s.qualityEventState[direction]
+	if ok {
+		previousStatus = previous.status
+	}
+	switch {
+	case !ok:
+		s.qualityEventState[direction] = signature
+		emit = s.rtpQualityConfig.EmitInitial || rtpStreamDiagnosisStatusRank(status) >= rtpStreamDiagnosisStatusRank(RTPStreamDiagnosisStatusWarning)
+	case previous != signature:
+		s.qualityEventState[direction] = signature
+		emit = true
+	}
+	s.qualityEventMu.Unlock()
+
+	if !emit {
+		return
+	}
+	emitRTPRelayQuality(s.rtpQualityHandler, RTPRelayQualityEvent{
+		Direction:      direction,
+		Status:         status,
+		PreviousStatus: previousStatus,
+		Reasons:        append([]RTPStreamDiagnosisReason(nil), reasons...),
+		Quality:        quality,
+		Diagnoses:      cloneRTPStreamDiagnoses(diagnoses),
+		ObservedAt:     observedAt,
+	})
+}
+
+func (s *RTPRelaySession) rtpRelayDirectionQuality(direction RTCPFeedbackDirection) RTPRelayDirectionQuality {
+	stats := s.Stats()
+	switch direction {
+	case RTCPFeedbackIMSToClient:
+		return newRTPRelayDirectionQuality(
+			RTCPFeedbackIMSToClient,
+			stats.IMSToClientRTPPackets,
+			stats.IMSToClientRTPBytes,
+			stats.IMSToClientRTPDrops,
+			stats.IMSToClientRTCPPackets,
+			stats.IMSToClientRTCPBytes,
+			stats.IMSToClientRTCPDrops,
+			stats.IMSToClientRTPStreams,
+			s.rtcpReportQuality(RTCPFeedbackIMSToClient),
+		)
+	default:
+		return newRTPRelayDirectionQuality(
+			RTCPFeedbackClientToIMS,
+			stats.ClientToIMSRTPPackets,
+			stats.ClientToIMSRTPBytes,
+			stats.ClientToIMSRTPDrops,
+			stats.ClientToIMSRTCPPackets,
+			stats.ClientToIMSRTCPBytes,
+			stats.ClientToIMSRTCPDrops,
+			stats.ClientToIMSRTPStreams,
+			s.rtcpReportQuality(RTCPFeedbackClientToIMS),
+		)
+	}
+}
+
+func (s *RTPRelaySession) rtpQualityDiagnosisConfig(direction RTCPFeedbackDirection) RTPStreamDiagnosisConfig {
+	if s == nil {
+		return RTPStreamDiagnosisConfig{}
+	}
+	cfg := s.rtpQualityConfig.ClientToIMS
+	clockRate := s.clientRTPClockRate
+	if direction == RTCPFeedbackIMSToClient {
+		cfg = s.rtpQualityConfig.IMSToClient
+		clockRate = s.imsRTPClockRate
+	}
+	if cfg.ClockRate <= 0 {
+		cfg.ClockRate = relayRTPClockRate(clockRate)
+	}
+	return cfg
+}
+
+func summarizeRTPRelayQualityDiagnoses(diagnoses []RTPStreamDiagnosis) (RTPStreamDiagnosisStatus, []RTPStreamDiagnosisReason) {
+	status := RTPStreamDiagnosisStatusUnknown
+	if len(diagnoses) == 0 {
+		return status, nil
+	}
+	var reasons []RTPStreamDiagnosisReason
+	seenReasons := make(map[RTPStreamDiagnosisReason]struct{})
+	for _, diagnosis := range diagnoses {
+		if rtpStreamDiagnosisStatusRank(diagnosis.Status) > rtpStreamDiagnosisStatusRank(status) {
+			status = diagnosis.Status
+		}
+		for _, reason := range diagnosis.Reasons {
+			if _, ok := seenReasons[reason]; ok {
+				continue
+			}
+			seenReasons[reason] = struct{}{}
+			reasons = append(reasons, reason)
+		}
+	}
+	return status, reasons
+}
+
+func summarizeRTPRelayRTCPReportQuality(reports []RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig, status RTPStreamDiagnosisStatus, reasons []RTPStreamDiagnosisReason) (RTPStreamDiagnosisStatus, []RTPStreamDiagnosisReason) {
+	diagnoses := DiagnoseRTPRelayRTCPReports(reports, cfg)
+	if len(diagnoses) == 0 {
+		return status, reasons
+	}
+	seenReasons := make(map[RTPStreamDiagnosisReason]struct{}, len(reasons))
+	for _, reason := range reasons {
+		seenReasons[reason] = struct{}{}
+	}
+	add := func(metric RTPStreamDiagnosisStatus, reason RTPStreamDiagnosisReason) {
+		if rtpStreamDiagnosisStatusRank(metric) > rtpStreamDiagnosisStatusRank(status) {
+			status = metric
+		}
+		if rtpStreamDiagnosisStatusRank(metric) < rtpStreamDiagnosisStatusRank(RTPStreamDiagnosisStatusWarning) {
+			return
+		}
+		if _, ok := seenReasons[reason]; ok {
+			return
+		}
+		seenReasons[reason] = struct{}{}
+		reasons = append(reasons, reason)
+	}
+	for _, diagnosis := range diagnoses {
+		add(diagnosis.Loss.Status, RTPStreamDiagnosisReasonPacketLoss)
+		add(diagnosis.Jitter.Status, RTPStreamDiagnosisReasonJitter)
+		add(diagnosis.RoundTripTime.Status, RTPStreamDiagnosisReasonRoundTripTime)
+	}
+	return status, reasons
+}
+
+func diagnoseRTPRelayRTCPReportLoss(report RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig) RTPRelayRTCPReportLossDiagnosis {
+	return RTPRelayRTCPReportLossDiagnosis{
+		Status:       rtpRelayRTCPReportLossStatus(report, cfg),
+		FractionLost: report.FractionLost,
+		TotalLost:    report.TotalLost,
+	}
+}
+
+func diagnoseRTPRelayRTCPReportJitter(report RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig) RTPRelayRTCPReportJitterDiagnosis {
+	diagnosis := RTPRelayRTCPReportJitterDiagnosis{
+		Status: RTPStreamDiagnosisStatusUnknown,
+		Jitter: report.Jitter,
+	}
+	if cfg.ClockRate <= 0 {
+		return diagnosis
+	}
+	diagnosis.Duration = rtpTimestampUnitsDuration(report.Jitter, cfg.ClockRate)
+	diagnosis.Status = rtpRelayRTCPReportJitterStatus(report, cfg)
+	return diagnosis
+}
+
+func diagnoseRTPRelayRTCPReportRoundTripTime(report RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig) RTPRelayRTCPReportRoundTripTimeDiagnosis {
+	diagnosis := RTPRelayRTCPReportRoundTripTimeDiagnosis{
+		Status:        RTPStreamDiagnosisStatusUnknown,
+		RoundTripTime: report.RoundTripTime,
+	}
+	if report.RoundTripTime <= 0 {
+		return diagnosis
+	}
+	switch {
+	case report.RoundTripTime >= cfg.RoundTripCritical:
+		diagnosis.Status = RTPStreamDiagnosisStatusCritical
+	case report.RoundTripTime >= cfg.RoundTripWarning:
+		diagnosis.Status = RTPStreamDiagnosisStatusWarning
+	default:
+		diagnosis.Status = RTPStreamDiagnosisStatusOK
+	}
+	return diagnosis
+}
+
+func rtpRelayRTCPReportLossStatus(report RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig) RTPStreamDiagnosisStatus {
+	switch {
+	case report.FractionLost >= cfg.LossCriticalFraction:
+		return RTPStreamDiagnosisStatusCritical
+	case report.FractionLost >= cfg.LossWarningFraction:
+		return RTPStreamDiagnosisStatusWarning
+	default:
+		return RTPStreamDiagnosisStatusOK
+	}
+}
+
+func rtpRelayRTCPReportJitterStatus(report RTPRelayRTCPReportQuality, cfg RTPStreamDiagnosisConfig) RTPStreamDiagnosisStatus {
+	if cfg.ClockRate <= 0 {
+		return RTPStreamDiagnosisStatusUnknown
+	}
+	jitter := rtpTimestampUnitsDuration(report.Jitter, cfg.ClockRate)
+	switch {
+	case jitter >= cfg.JitterCritical:
+		return RTPStreamDiagnosisStatusCritical
+	case jitter >= cfg.JitterWarning:
+		return RTPStreamDiagnosisStatusWarning
+	default:
+		return RTPStreamDiagnosisStatusOK
+	}
+}
+
+func (d *RTPRelayRTCPReportDiagnosis) addMetric(status RTPStreamDiagnosisStatus, reason RTPStreamDiagnosisReason) {
+	if rtpStreamDiagnosisStatusRank(status) > rtpStreamDiagnosisStatusRank(d.Status) {
+		d.Status = status
+	}
+	if rtpStreamDiagnosisStatusRank(status) >= rtpStreamDiagnosisStatusRank(RTPStreamDiagnosisStatusWarning) {
+		d.Reasons = append(d.Reasons, reason)
+	}
+}
+
+func rtpRelayRTCPReportAction(diagnosis RTPRelayRTCPReportDiagnosis) RTPRelayQualityAction {
+	if rtpStreamDiagnosisStatusRank(diagnosis.Status) < rtpStreamDiagnosisStatusRank(RTPStreamDiagnosisStatusWarning) {
+		return RTPRelayQualityActionNone
+	}
+	if diagnosis.Loss.Status == RTPStreamDiagnosisStatusCritical ||
+		diagnosis.RoundTripTime.Status == RTPStreamDiagnosisStatusCritical {
+		return RTPRelayQualityActionRecoverMediaPath
+	}
+	if diagnosis.Jitter.Status == RTPStreamDiagnosisStatusCritical {
+		return RTPRelayQualityActionIncreaseJitterBuffer
+	}
+	if diagnosis.Loss.Status == RTPStreamDiagnosisStatusWarning {
+		return RTPRelayQualityActionReduceBitrate
+	}
+	if diagnosis.Jitter.Status == RTPStreamDiagnosisStatusWarning {
+		return RTPRelayQualityActionIncreaseJitterBuffer
+	}
+	if diagnosis.RoundTripTime.Status == RTPStreamDiagnosisStatusWarning {
+		return RTPRelayQualityActionMonitor
+	}
+	return RTPRelayQualityActionMonitor
+}
+
+func newRTPRelayQualitySignature(status RTPStreamDiagnosisStatus, reasons []RTPStreamDiagnosisReason) rtpRelayQualitySignature {
+	parts := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		parts = append(parts, string(reason))
+	}
+	return rtpRelayQualitySignature{status: status, reasons: strings.Join(parts, "\x00")}
+}
+
+func cloneRTPStreamDiagnoses(in []RTPStreamDiagnosis) []RTPStreamDiagnosis {
+	out := append([]RTPStreamDiagnosis(nil), in...)
+	for i := range out {
+		out[i].Reasons = append([]RTPStreamDiagnosisReason(nil), out[i].Reasons...)
+	}
+	return out
+}
+
+func emitRTPRelayQuality(handler RTPRelayQualityHandler, event RTPRelayQualityEvent) {
+	if handler != nil {
+		handler(event)
+	}
 }
 
 func (s *RTPRelaySession) RTPPlaintextHandler() RTPPlaintextHandler {
@@ -991,13 +1372,22 @@ func (s *RTPRelaySession) observeRTPStream(direction RTPDTMFDirection, packet []
 	if s == nil || len(packet) == 0 || clockRate <= 0 {
 		return
 	}
+	observed := false
 	s.rtpStatsMu.Lock()
-	defer s.rtpStatsMu.Unlock()
 	switch direction {
 	case RTPDTMFClientToIMS:
-		_, _ = s.clientToIMSRTPStats.ObserveRTPPacket(packet, arrival, clockRate)
+		_, err := s.clientToIMSRTPStats.ObserveRTPPacket(packet, arrival, clockRate)
+		observed = err == nil
 	case RTPDTMFIMSToClient:
-		_, _ = s.imsToClientRTPStats.ObserveRTPPacket(packet, arrival, clockRate)
+		_, err := s.imsToClientRTPStats.ObserveRTPPacket(packet, arrival, clockRate)
+		observed = err == nil
+	}
+	s.rtpStatsMu.Unlock()
+	if !observed {
+		return
+	}
+	if qualityDirection, ok := rtcpFeedbackDirectionFromRTPDirection(direction); ok {
+		s.emitRTPQualityEventIfChanged(qualityDirection, arrival)
 	}
 }
 
@@ -1269,6 +1659,17 @@ func normalizeRTPDTMFDirection(direction RTPDTMFDirection) (RTPDTMFDirection, er
 	}
 }
 
+func rtcpFeedbackDirectionFromRTPDirection(direction RTPDTMFDirection) (RTCPFeedbackDirection, bool) {
+	switch direction {
+	case RTPDTMFClientToIMS:
+		return RTCPFeedbackClientToIMS, true
+	case RTPDTMFIMSToClient:
+		return RTCPFeedbackIMSToClient, true
+	default:
+		return "", false
+	}
+}
+
 func rtpDTMFGenerationPayload(req RTPRelayDTMFRequest, payloads map[uint8]int) (uint8, int) {
 	if req.PayloadType != 0 {
 		clockRate := req.ClockRate
@@ -1521,13 +1922,17 @@ func (s *RTPRelaySession) recordRTCPSenderReport(event RTCPFeedbackEvent, observ
 	s.rtcpSenderReportTiming[rtpRelayRTCPSenderReportKey{direction: direction, ssrc: event.SSRC}] = timing
 	s.rtcpQualityMu.Unlock()
 
+	updated := false
 	s.rtpStatsMu.Lock()
-	defer s.rtpStatsMu.Unlock()
 	switch direction {
 	case RTCPFeedbackClientToIMS:
-		_, _ = s.clientToIMSRTPStats.ObserveRTCPSenderReport(event.SSRC, event.NTPTime, observedAt)
+		_, updated = s.clientToIMSRTPStats.ObserveRTCPSenderReport(event.SSRC, event.NTPTime, observedAt)
 	case RTCPFeedbackIMSToClient:
-		_, _ = s.imsToClientRTPStats.ObserveRTCPSenderReport(event.SSRC, event.NTPTime, observedAt)
+		_, updated = s.imsToClientRTPStats.ObserveRTCPSenderReport(event.SSRC, event.NTPTime, observedAt)
+	}
+	s.rtpStatsMu.Unlock()
+	if updated {
+		s.emitRTPQualityEventIfChanged(direction, observedAt)
 	}
 }
 
@@ -1540,7 +1945,6 @@ func (s *RTPRelaySession) recordRTCPReportQuality(event RTCPFeedbackEvent, obser
 		return
 	}
 	s.rtcpQualityMu.Lock()
-	defer s.rtcpQualityMu.Unlock()
 	reports := s.clientToIMSRTCPReports
 	if direction == RTCPFeedbackIMSToClient {
 		reports = s.imsToClientRTCPReports
@@ -1569,6 +1973,8 @@ func (s *RTPRelaySession) recordRTCPReportQuality(event RTCPFeedbackEvent, obser
 			RoundTripTime:      roundTripTime,
 		}
 	}
+	s.rtcpQualityMu.Unlock()
+	s.emitRTPQualityEventIfChanged(direction, observedAt)
 }
 
 func (s *RTPRelaySession) rtcpReportRoundTripTimeLocked(direction RTCPFeedbackDirection, report RTCPReceptionReport, observedAt time.Time) time.Duration {
